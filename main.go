@@ -558,6 +558,9 @@ func parseArgs() Config {
 		case "--help":
 			printHelp()
 			os.Exit(0)
+		case "--quickstart":
+			printQuickstart()
+			os.Exit(0)
 		case "--raw":
 			config.RawFlag = true
 		case "--truncate-after":
@@ -632,6 +635,7 @@ Usage: surf <url> [options]
 
 Options:
   --help                     Show this help message
+  --quickstart               Show detailed usage guide for AI agents
   --raw                      Output raw page instead of converting to markdown
   --truncate-after <number>  Truncate output after <number> characters and append a notice (default: %d)
   --screenshot <filepath>    Take a screenshot of the page and save it to the given filepath
@@ -656,6 +660,86 @@ Examples:
   surf https://example.com --headful --window-size 1920x1080
   surf localhost:4000/login --form login_form --input email --value test@example.com --input password --value secret
 `, DEFAULT_TRUNCATE_AFTER)
+}
+
+func printQuickstart() {
+	fmt.Print(`surf - Web Browser for LLMs
+
+Converts web pages to markdown with full JavaScript execution.
+Fork of chrismccord/web.
+
+BASIC USAGE
+  surf https://example.com          Convert page to markdown
+  surf example.com                  Protocol auto-added (http://)
+
+OUTPUT MODES
+  surf https://example.com          Markdown output (default, optimized for LLMs)
+  surf https://example.com --raw    Raw HTML output
+  surf url --truncate-after 5000    Limit output to 5000 chars
+
+SCREENSHOTS
+  surf https://example.com --screenshot page.png
+  surf https://example.com --screenshot shot.png --truncate-after 5000
+
+JAVASCRIPT EXECUTION
+  surf https://example.com --js "document.querySelector('button').click()"
+  surf https://example.com --js "console.log(document.title)"
+  Console output (log/warn/error) is captured and appended to output.
+
+FORM FILLING
+  surf https://login.example.com \
+      --form "login_form" \
+      --input "username" --value "myuser" \
+      --input "password" --value "mypass"
+
+  Navigate after submit:
+  surf https://login.example.com \
+      --form "login_form" \
+      --input "email" --value "me@example.com" \
+      --after-submit "https://example.com/dashboard"
+
+HEADFUL MODE (visible browser for debugging)
+  surf https://example.com --headful
+  surf https://example.com --headful --window-size 1920x1080
+
+SESSION PROFILES (persistent cookies/auth)
+  surf --profile "github" https://github.com
+  surf --profile "github" https://github.com/settings
+  Profiles stored in ~/.surf/profiles/<name>/
+
+PHOENIX LIVEVIEW
+  Automatically detected and handled:
+  - Waits for .phx-connected before proceeding
+  - Handles LiveView form submissions correctly
+  - Manages navigation events and state updates
+
+AGENT INTEGRATION TIPS
+  - Output is markdown, optimized for LLM context windows
+  - Console logs captured and appended (useful for debugging)
+  - Use --truncate-after to limit output size for large pages
+  - Use --screenshot to verify visual state
+  - Profiles persist auth across multiple surf calls
+  - Combine --js with --screenshot to capture post-interaction state
+
+EXAMPLES
+  # Scrape and summarize
+  surf https://news.ycombinator.com
+
+  # Login and capture authenticated page
+  surf https://app.example.com/login \
+      --form "login" --input "email" --value "me@x.com" \
+      --input "password" --value "secret" \
+      --after-submit "https://app.example.com/dashboard" \
+      --profile "myapp"
+
+  # Click a button and screenshot result
+  surf https://example.com \
+      --js "document.querySelector('#submit-btn').click()" \
+      --screenshot result.png
+
+  # Debug with visible browser
+  surf https://example.com --headful --window-size 1280x720
+`)
 }
 
 // parseWindowSize parses a window size string like "1280x720" into width and height
