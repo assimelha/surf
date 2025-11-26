@@ -32,6 +32,7 @@ surf https://login.example.com \
 - **Form filling** - Automated form interaction with LiveView-aware submissions
 - **Session persistence** - Maintains cookies and authentication across runs with profiles
 - **Headful mode** - Run with visible browser window for debugging
+- **Persistent sessions** - Keep browser open between commands for multi-step workflows
 
 ## Installation
 
@@ -89,6 +90,12 @@ surf example.com --js "document.querySelector('button').click()"
 
 # Use named session profile
 ./surf --profile "mysite" https://authenticated-site.com
+
+# Persistent session (browser stays open between commands)
+surf https://example.com --session myapp --headful    # Start session
+surf https://example.com/page2 --session myapp        # Reuse same browser/tab
+surf https://example.com --session myapp --js "document.querySelector('a').click()"
+surf --session myapp --stop                           # Close browser when done
 ```
 
 ## Options
@@ -109,6 +116,8 @@ Options:
   --profile <name>           Use or create named session profile (default: "default")
   --headful                  Run browser in visible window mode (not headless)
   --window-size <WxH>        Set browser window size (e.g., 1280x720), useful with --headful
+  --session <id>             Use persistent browser session (stays open between calls)
+  --stop                     Stop a persistent session (requires --session)
 ```
 
 ## Phoenix LiveView Support
@@ -165,6 +174,7 @@ make clean        # Remove build artifacts
 - **Self-contained directory structure**:
   - `~/.surf/chromium/` - Headless Chromium browser
   - `~/.surf/profiles/` - Isolated session profiles for persistence
+  - `~/.surf/sessions/` - Active persistent session state
 - **Cross-platform** - Builds for macOS (Intel/ARM64) and Linux x86_64
 - **Chrome DevTools Protocol** - Uses chromedp for direct browser communication (no separate driver needed)
 

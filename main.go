@@ -8,14 +8,17 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	cdpruntime "github.com/chromedp/cdproto/runtime"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 	"github.com/jaytaylor/html2text"
 )
@@ -39,10 +42,34 @@ type Config struct {
 	RawFlag        bool
 	Headful        bool
 	WindowSize     string
+	Session        string
+	StopSession    bool
+}
+
+type SessionInfo struct {
+	WSURL    string `json:"ws_url"`
+	Profile  string `json:"profile"`
+	Headful  bool   `json:"headful"`
+	PID      int    `json:"pid"`
+	TargetID string `json:"target_id"`
 }
 
 func main() {
 	config := parseArgs()
+
+	// Handle --stop flag for session
+	if config.StopSession {
+		if config.Session == "" {
+			fmt.Fprintf(os.Stderr, "Error: --stop requires --session <id>\n")
+			os.Exit(1)
+		}
+		if err := stopSession(config.Session); err != nil {
+			fmt.Fprintf(os.Stderr, "Error stopping session: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Session '%s' stopped\n", config.Session)
+		return
+	}
 
 	if config.URL == "" {
 		printHelp()
@@ -66,6 +93,26 @@ func main() {
 	fmt.Println(result)
 }
 
+func stopSession(sessionID string) error {
+	info, err := loadSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("session '%s' not found", sessionID)
+	}
+
+	// Kill the browser process
+	if info.PID > 0 {
+		proc, err := os.FindProcess(info.PID)
+		if err == nil {
+			proc.Signal(os.Interrupt)
+			time.Sleep(500 * time.Millisecond)
+			proc.Kill()
+		}
+	}
+
+	// Remove session file
+	return removeSession(sessionID)
+}
+
 func getChromiumDir() string {
 	homeDir, _ := os.UserHomeDir()
 	return filepath.Join(homeDir, ".surf")
@@ -86,6 +133,132 @@ func getChromiumExec() string {
 	default:
 		return ""
 	}
+}
+
+func getSessionsDir() string {
+	return filepath.Join(getChromiumDir(), "sessions")
+}
+
+func getSessionFile(sessionID string) string {
+	return filepath.Join(getSessionsDir(), sessionID+".json")
+}
+
+func saveSession(sessionID string, info SessionInfo) error {
+	sessionsDir := getSessionsDir()
+	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(getSessionFile(sessionID), data, 0644)
+}
+
+func loadSession(sessionID string) (*SessionInfo, error) {
+	data, err := os.ReadFile(getSessionFile(sessionID))
+	if err != nil {
+		return nil, err
+	}
+	var info SessionInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+func removeSession(sessionID string) error {
+	return os.Remove(getSessionFile(sessionID))
+}
+
+// startSessionBrowser starts a Chrome process for a persistent session
+func startSessionBrowser(config Config) (*SessionInfo, error) {
+	chromiumExec := getChromiumExec()
+	chromiumDir := getChromiumDir()
+	profileDir := filepath.Join(chromiumDir, "profiles", config.Profile)
+	os.MkdirAll(profileDir, 0755)
+
+	// Find a free port for remote debugging
+	port := findFreePort()
+
+	args := []string{
+		fmt.Sprintf("--remote-debugging-port=%d", port),
+		fmt.Sprintf("--user-data-dir=%s", profileDir),
+		"--disable-gpu",
+		"--no-sandbox",
+		"--disable-dev-shm-usage",
+		"--disable-backgrounding-occluded-windows",
+		"--disable-renderer-backgrounding",
+		"--disable-extensions",
+		"--disable-component-extensions-with-background-pages",
+		"--disable-default-apps",
+		"--no-first-run",
+		"--disable-fre",
+	}
+
+	if !config.Headful {
+		args = append(args, "--headless=new")
+	}
+
+	if config.WindowSize != "" {
+		w, h := parseWindowSize(config.WindowSize)
+		args = append(args, fmt.Sprintf("--window-size=%d,%d", w, h))
+	}
+
+	// Start with a blank page
+	args = append(args, "about:blank")
+
+	cmd := exec.Command(chromiumExec, args...)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	// Detach process so it survives after surf exits
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start browser: %v", err)
+	}
+
+	// Wait for browser to be ready and get websocket URL
+	wsURL, err := waitForBrowserReady(port, 10*time.Second)
+	if err != nil {
+		cmd.Process.Kill()
+		return nil, fmt.Errorf("browser failed to start: %v", err)
+	}
+
+	return &SessionInfo{
+		WSURL:   wsURL,
+		Profile: config.Profile,
+		Headful: config.Headful,
+		PID:     cmd.Process.Pid,
+	}, nil
+}
+
+func findFreePort() int {
+	// Start from a high port and find one that works
+	// The browser will bind to this port for debugging
+	return 9222 + int(time.Now().UnixNano()%1000)
+}
+
+func waitForBrowserReady(port int, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	url := fmt.Sprintf("http://127.0.0.1:%d/json/version", port)
+
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err == nil {
+			defer resp.Body.Close()
+			var result map[string]interface{}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+				if wsURL, ok := result["webSocketDebuggerUrl"].(string); ok {
+					return wsURL, nil
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return "", fmt.Errorf("timeout waiting for browser on port %d", port)
 }
 
 func ensureChromium() error {
@@ -222,36 +395,82 @@ func extractZip(src, dest string) error {
 func processRequest(config Config) (string, error) {
 	baseURL := ensureProtocol(config.URL)
 
-	chromiumExec := getChromiumExec()
-	chromiumDir := getChromiumDir()
-	profileDir := filepath.Join(chromiumDir, "profiles", config.Profile)
-	os.MkdirAll(profileDir, 0755)
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var allocCancel context.CancelFunc
+	isSession := config.Session != ""
+	var sessionInfo *SessionInfo
 
-	// Set up chromedp allocator options
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.ExecPath(chromiumExec),
-		chromedp.UserDataDir(profileDir),
-		chromedp.Flag("headless", !config.Headful),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-backgrounding-occluded-windows", true),
-		chromedp.Flag("disable-renderer-backgrounding", true),
-		chromedp.Flag("disable-extensions", true),
-		chromedp.Flag("disable-component-extensions-with-background-pages", true),
-		chromedp.Flag("disable-default-apps", true),
-	)
+	if isSession {
+		// Session mode: connect to existing or start new browser
+		existingSession, err := loadSession(config.Session)
+		if err == nil {
+			// Connect to existing session
+			sessionInfo = existingSession
+			fmt.Fprintf(os.Stderr, "Connecting to session '%s'...\n", config.Session)
+		} else {
+			// Start new session browser
+			fmt.Fprintf(os.Stderr, "Starting new session '%s'...\n", config.Session)
+			sessionInfo, err = startSessionBrowser(config)
+			if err != nil {
+				return "", err
+			}
+		}
 
-	// Add window size if specified
-	if config.WindowSize != "" {
-		opts = append(opts, chromedp.WindowSize(parseWindowSize(config.WindowSize)))
+		// Connect to the browser via websocket
+		allocCtx, allocCancelFunc := chromedp.NewRemoteAllocator(context.Background(), sessionInfo.WSURL)
+		allocCancel = allocCancelFunc
+
+		if sessionInfo.TargetID != "" {
+			// Attach to existing tab
+			ctx, cancel = chromedp.NewContext(allocCtx,
+				chromedp.WithTargetID(target.ID(sessionInfo.TargetID)))
+		} else {
+			// Create new tab
+			ctx, cancel = chromedp.NewContext(allocCtx)
+		}
+
+		// If this is a new session (no target ID yet), save it after first run
+		if sessionInfo.TargetID == "" {
+			// We need to run something to create the target, then get its ID
+			if err := chromedp.Run(ctx); err != nil {
+				return "", fmt.Errorf("failed to initialize browser context: %v", err)
+			}
+			sessionInfo.TargetID = string(chromedp.FromContext(ctx).Target.TargetID)
+			if err := saveSession(config.Session, *sessionInfo); err != nil {
+				return "", fmt.Errorf("failed to save session: %v", err)
+			}
+		}
+	} else {
+		// One-shot mode: start fresh browser that will be closed
+		chromiumExec := getChromiumExec()
+		chromiumDir := getChromiumDir()
+		profileDir := filepath.Join(chromiumDir, "profiles", config.Profile)
+		os.MkdirAll(profileDir, 0755)
+
+		opts := append(chromedp.DefaultExecAllocatorOptions[:],
+			chromedp.ExecPath(chromiumExec),
+			chromedp.UserDataDir(profileDir),
+			chromedp.Flag("headless", !config.Headful),
+			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("no-sandbox", true),
+			chromedp.Flag("disable-dev-shm-usage", true),
+			chromedp.Flag("disable-backgrounding-occluded-windows", true),
+			chromedp.Flag("disable-renderer-backgrounding", true),
+			chromedp.Flag("disable-extensions", true),
+			chromedp.Flag("disable-component-extensions-with-background-pages", true),
+			chromedp.Flag("disable-default-apps", true),
+		)
+
+		if config.WindowSize != "" {
+			opts = append(opts, chromedp.WindowSize(parseWindowSize(config.WindowSize)))
+		}
+
+		allocCtx, allocCancelFunc := chromedp.NewExecAllocator(context.Background(), opts...)
+		allocCancel = allocCancelFunc
+
+		ctx, cancel = chromedp.NewContext(allocCtx)
 	}
-
-	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer allocCancel()
-
-	ctx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
 
 	// Set up timeout
 	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 60*time.Second)
@@ -461,17 +680,25 @@ func processRequest(config Config) (string, error) {
 	}
 	consoleMu.Unlock()
 
-	// Navigate away to trigger localStorage flush before shutdown
-	chromedp.Run(ctx, chromedp.Navigate("about:blank"))
-	// Wait for navigation to complete
-	time.Sleep(100 * time.Millisecond)
+	if isSession {
+		// Session mode: keep browser and tab running
+		// Don't call cancel() as it may close the tab
+		// Just let the context go out of scope
+		_ = cancel
+		_ = allocCancel
+	} else {
+		// One-shot mode: close browser
+		// Navigate away to trigger localStorage flush before shutdown
+		chromedp.Run(ctx, chromedp.Navigate("about:blank"))
+		time.Sleep(100 * time.Millisecond)
 
-	// Explicitly cancel context to ensure browser shuts down
-	timeoutCancel()
-	cancel()
-	// Wait for browser process to fully exit and flush data
-	time.Sleep(500 * time.Millisecond)
-	allocCancel()
+		// Explicitly cancel context to ensure browser shuts down
+		timeoutCancel()
+		cancel()
+		// Wait for browser process to fully exit and flush data
+		time.Sleep(500 * time.Millisecond)
+		allocCancel()
+	}
 
 	return result, nil
 }
@@ -618,6 +845,13 @@ func parseArgs() Config {
 				config.WindowSize = args[i+1]
 				i++
 			}
+		case "--session":
+			if i+1 < len(args) {
+				config.Session = args[i+1]
+				i++
+			}
+		case "--stop":
+			config.StopSession = true
 		default:
 			if config.URL == "" && !strings.HasPrefix(arg, "--") {
 				config.URL = arg
@@ -647,6 +881,8 @@ Options:
   --profile <name>           Use or create named session profile (default: "default")
   --headful                  Run browser in visible window mode (not headless)
   --window-size <WxH>        Set browser window size (e.g., 1280x720), useful with --headful
+  --session <id>             Use persistent browser session (stays open between calls)
+  --stop                     Stop a persistent session (requires --session)
 
 Phoenix LiveView Support:
 This tool automatically detects Phoenix LiveView applications and properly handles:
@@ -702,6 +938,16 @@ HEADFUL MODE (visible browser for debugging)
   surf https://example.com --headful
   surf https://example.com --headful --window-size 1920x1080
 
+PERSISTENT SESSIONS (keep browser open between calls)
+  surf https://example.com --session myapp            # Start session, fetch page
+  surf https://example.com/page2 --session myapp      # Reuse same browser
+  surf https://example.com/page3 --session myapp --screenshot page.png
+  surf --session myapp --stop                         # Close browser when done
+
+  Multiple sessions can run in parallel:
+  surf https://site-a.com --session agent1 --headful
+  surf https://site-b.com --session agent2 --headful
+
 SESSION PROFILES (persistent cookies/auth)
   surf --profile "github" https://github.com
   surf --profile "github" https://github.com/settings
@@ -720,6 +966,8 @@ AGENT INTEGRATION TIPS
   - Use --screenshot to verify visual state
   - Profiles persist auth across multiple surf calls
   - Combine --js with --screenshot to capture post-interaction state
+  - Use --session for multi-step workflows (faster, maintains state)
+  - Multiple agents can use separate --session IDs in parallel
 
 EXAMPLES
   # Scrape and summarize
