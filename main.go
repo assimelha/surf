@@ -2,19 +2,22 @@ package main
 
 import (
 	"archive/zip"
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
+	goruntime "runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	cdpruntime "github.com/chromedp/cdproto/runtime"
+	"github.com/chromedp/chromedp"
 	"github.com/jaytaylor/html2text"
-	"github.com/tebeka/selenium"
-	"github.com/tebeka/selenium/log"
 )
 
 const DEFAULT_TRUNCATE_AFTER = 100000
@@ -34,6 +37,8 @@ type Config struct {
 	ScreenshotPath string
 	TruncateAfter  int
 	RawFlag        bool
+	Headful        bool
+	WindowSize     string
 }
 
 func main() {
@@ -44,16 +49,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Ensure Firefox and geckodriver are installed
-	err := ensureFirefox()
+	// Ensure Chromium is installed
+	err := ensureChromium()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error setting up Firefox: %v\n", err)
-		os.Exit(1)
-	}
-
-	err = ensureGeckodriver()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error setting up geckodriver: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error setting up Chromium: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -67,204 +66,70 @@ func main() {
 	fmt.Println(result)
 }
 
-func ensureFirefox() error {
-	// Get home directory for our isolated Firefox installation
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("could not get home directory: %v", err)
-	}
+func getChromiumDir() string {
+	homeDir, _ := os.UserHomeDir()
+	return filepath.Join(homeDir, ".surf")
+}
 
-	firefoxDir := filepath.Join(homeDir, ".web-firefox")
-
-	// Platform-specific Firefox paths and URLs
-	var firefoxExec string
-	var firefoxUrl string
-	var firefoxSubdir string
-
-	switch runtime.GOOS {
+func getChromiumExec() string {
+	chromiumDir := getChromiumDir()
+	switch goruntime.GOOS {
 	case "darwin":
-		if runtime.GOARCH == "arm64" {
-			firefoxSubdir = "firefox"
-			firefoxExec = filepath.Join(firefoxDir, firefoxSubdir, "Nightly.app", "Contents", "MacOS", "firefox")
-			firefoxUrl = "https://playwright.azureedge.net/builds/firefox/1490/firefox-mac-arm64.zip"
-		} else {
-			firefoxSubdir = "firefox"
-			firefoxExec = filepath.Join(firefoxDir, firefoxSubdir, "Nightly.app", "Contents", "MacOS", "firefox")
-			firefoxUrl = "https://playwright.azureedge.net/builds/firefox/1490/firefox-mac.zip"
+		// Playwright Chromium uses "Google Chrome for Testing.app" and architecture-specific directories
+		archSuffix := ""
+		if goruntime.GOARCH == "arm64" {
+			archSuffix = "-arm64"
 		}
+		return filepath.Join(chromiumDir, "chromium", "chrome-mac"+archSuffix, "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing")
 	case "linux":
-		firefoxSubdir = "firefox"
-		firefoxExec = filepath.Join(firefoxDir, firefoxSubdir, "firefox")
-		firefoxUrl = "https://playwright.azureedge.net/builds/firefox/1490/firefox-ubuntu-22.04.zip"
+		return filepath.Join(chromiumDir, "chromium", "chrome-linux", "chrome")
 	default:
-		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+		return ""
+	}
+}
+
+func ensureChromium() error {
+	chromiumExec := getChromiumExec()
+	if chromiumExec == "" {
+		return fmt.Errorf("unsupported platform: %s", goruntime.GOOS)
 	}
 
-	// Check if Firefox executable exists
-	if _, err := os.Stat(firefoxExec); err == nil {
+	// Check if Chromium executable exists
+	if _, err := os.Stat(chromiumExec); err == nil {
 		return nil
 	}
 
-	// Download and extract Firefox
-	fmt.Println("Firefox not found, downloading...")
-	err = downloadFirefox(firefoxUrl, firefoxDir)
+	// Download and extract Chromium
+	fmt.Println("Chromium not found, downloading...")
+
+	var chromiumUrl string
+	switch goruntime.GOOS {
+	case "darwin":
+		if goruntime.GOARCH == "arm64" {
+			chromiumUrl = "https://playwright.azureedge.net/builds/chromium/1200/chromium-mac-arm64.zip"
+		} else {
+			chromiumUrl = "https://playwright.azureedge.net/builds/chromium/1200/chromium-mac.zip"
+		}
+	case "linux":
+		chromiumUrl = "https://playwright.azureedge.net/builds/chromium/1200/chromium-linux.zip"
+	}
+
+	chromiumDir := getChromiumDir()
+	err := downloadChromium(chromiumUrl, filepath.Join(chromiumDir, "chromium"))
 	if err != nil {
-		return fmt.Errorf("failed to download Firefox: %v", err)
+		return fmt.Errorf("failed to download Chromium: %v", err)
 	}
 
 	// Verify the executable exists after download
-	if _, err := os.Stat(firefoxExec); err != nil {
-		return fmt.Errorf("Firefox executable not found after download: %s", firefoxExec)
+	if _, err := os.Stat(chromiumExec); err != nil {
+		return fmt.Errorf("Chromium executable not found after download: %s", chromiumExec)
 	}
 
-	fmt.Printf("Firefox downloaded to: %s\n", firefoxDir)
+	fmt.Printf("Chromium downloaded to: %s\n", chromiumDir)
 	return nil
 }
 
-func ensureGeckodriver() error {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("could not get home directory: %v", err)
-	}
-
-	geckoDir := filepath.Join(homeDir, ".web-firefox", "geckodriver")
-	var geckoExec string
-	var geckoUrl string
-
-	switch runtime.GOOS {
-	case "darwin":
-		if runtime.GOARCH == "arm64" {
-			geckoExec = filepath.Join(geckoDir, "geckodriver")
-			geckoUrl = "https://github.com/mozilla/geckodriver/releases/download/v0.35.0/geckodriver-v0.35.0-macos-aarch64.tar.gz"
-		} else {
-			geckoExec = filepath.Join(geckoDir, "geckodriver")
-			geckoUrl = "https://github.com/mozilla/geckodriver/releases/download/v0.35.0/geckodriver-v0.35.0-macos.tar.gz"
-		}
-	case "linux":
-		geckoExec = filepath.Join(geckoDir, "geckodriver")
-		geckoUrl = "https://github.com/mozilla/geckodriver/releases/download/v0.35.0/geckodriver-v0.35.0-linux64.tar.gz"
-	default:
-		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
-	}
-
-	// Check if geckodriver exists
-	if _, err := os.Stat(geckoExec); err == nil {
-		return nil
-	}
-
-	// Download and extract geckodriver
-	fmt.Println("Geckodriver not found, downloading...")
-	err = downloadAndExtractTarGz(geckoUrl, geckoDir)
-	if err != nil {
-		return fmt.Errorf("failed to download geckodriver: %v", err)
-	}
-
-	// Make executable
-	if err := os.Chmod(geckoExec, 0755); err != nil {
-		return fmt.Errorf("failed to make geckodriver executable: %v", err)
-	}
-
-	fmt.Printf("Geckodriver downloaded to: %s\n", geckoDir)
-	return nil
-}
-
-func downloadAndExtractTarGz(url, destDir string) error {
-	// Create destination directory
-	err := os.MkdirAll(destDir, 0755)
-	if err != nil {
-		return fmt.Errorf("could not create directory %s: %v", destDir, err)
-	}
-
-	// Download the tar.gz file
-	fmt.Printf("Downloading from %s...\n", url)
-	resp, err := http.Get(url)
-	if err != nil {
-		return fmt.Errorf("could not download: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bad status: %s", resp.Status)
-	}
-
-	// Create temporary file
-	tempFile, err := os.CreateTemp("", "geckodriver-*.tar.gz")
-	if err != nil {
-		return fmt.Errorf("could not create temp file: %v", err)
-	}
-	defer os.Remove(tempFile.Name())
-	defer tempFile.Close()
-
-	// Copy download to temp file
-	_, err = io.Copy(tempFile, resp.Body)
-	if err != nil {
-		return fmt.Errorf("could not save download: %v", err)
-	}
-
-	tempFile.Close()
-
-	// Extract using tar command
-	fmt.Println("Extracting geckodriver...")
-	return extractTarGz(tempFile.Name(), destDir)
-}
-
-func extractTarGz(src, dest string) error {
-	// Use system tar command for simplicity
-	cmd := fmt.Sprintf("tar -xzf %s -C %s", src, dest)
-	if err := runCommand(cmd); err != nil {
-		return fmt.Errorf("failed to extract tar.gz: %v", err)
-	}
-	return nil
-}
-
-func runCommand(cmd string) error {
-	// Simple command execution
-	parts := strings.Fields(cmd)
-	if len(parts) == 0 {
-		return fmt.Errorf("empty command")
-	}
-
-	proc := &os.Process{}
-	attr := &os.ProcAttr{
-		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
-	}
-
-	// Find the executable
-	executable, err := findExecutable(parts[0])
-	if err != nil {
-		return err
-	}
-
-	proc, err = os.StartProcess(executable, parts, attr)
-	if err != nil {
-		return err
-	}
-
-	state, err := proc.Wait()
-	if err != nil {
-		return err
-	}
-
-	if !state.Success() {
-		return fmt.Errorf("command failed: %s", cmd)
-	}
-
-	return nil
-}
-
-func findExecutable(name string) (string, error) {
-	// Simple path search
-	paths := []string{"/bin", "/usr/bin", "/usr/local/bin"}
-	for _, dir := range paths {
-		path := filepath.Join(dir, name)
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
-		}
-	}
-	return "", fmt.Errorf("executable not found: %s", name)
-}
-
-func downloadFirefox(url, destDir string) error {
+func downloadChromium(url, destDir string) error {
 	// Create destination directory
 	err := os.MkdirAll(destDir, 0755)
 	if err != nil {
@@ -272,10 +137,10 @@ func downloadFirefox(url, destDir string) error {
 	}
 
 	// Download the zip file
-	fmt.Printf("Downloading Firefox from %s...\n", url)
+	fmt.Printf("Downloading Chromium from %s...\n", url)
 	resp, err := http.Get(url)
 	if err != nil {
-		return fmt.Errorf("could not download Firefox: %v", err)
+		return fmt.Errorf("could not download Chromium: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -284,7 +149,7 @@ func downloadFirefox(url, destDir string) error {
 	}
 
 	// Create temporary file
-	tempFile, err := os.CreateTemp("", "firefox-*.zip")
+	tempFile, err := os.CreateTemp("", "chromium-*.zip")
 	if err != nil {
 		return fmt.Errorf("could not create temp file: %v", err)
 	}
@@ -300,7 +165,7 @@ func downloadFirefox(url, destDir string) error {
 	tempFile.Close()
 
 	// Extract the zip file
-	fmt.Println("Extracting Firefox...")
+	fmt.Println("Extracting Chromium...")
 	return extractZip(tempFile.Name(), destDir)
 }
 
@@ -357,124 +222,131 @@ func extractZip(src, dest string) error {
 func processRequest(config Config) (string, error) {
 	baseURL := ensureProtocol(config.URL)
 
-	// Get Firefox and geckodriver paths
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("could not get home directory: %v", err)
-	}
-
-	firefoxDir := filepath.Join(homeDir, ".web-firefox")
-	geckoDriverPath := filepath.Join(firefoxDir, "geckodriver", "geckodriver")
-
-	var firefoxExec string
-	switch runtime.GOOS {
-	case "darwin":
-		firefoxExec = filepath.Join(firefoxDir, "firefox", "Nightly.app", "Contents", "MacOS", "firefox")
-	case "linux":
-		firefoxExec = filepath.Join(firefoxDir, "firefox", "firefox")
-	}
-
-	// Start geckodriver service
-	service, err := selenium.NewGeckoDriverService(geckoDriverPath, 4444)
-	if err != nil {
-		return "", fmt.Errorf("could not start geckodriver service: %v", err)
-	}
-	defer service.Stop()
-
-	// Configure Firefox with profile
-	profileDir := filepath.Join(homeDir, ".web-firefox", "profiles", config.Profile)
+	chromiumExec := getChromiumExec()
+	chromiumDir := getChromiumDir()
+	profileDir := filepath.Join(chromiumDir, "profiles", config.Profile)
 	os.MkdirAll(profileDir, 0755)
 
-	caps := selenium.Capabilities{
-		"browserName": "firefox",
-		"moz:firefoxOptions": map[string]interface{}{
-			"binary": firefoxExec,
-			"args":   []string{"-headless", "-profile", profileDir},
-			"prefs": map[string]interface{}{
-				"devtools.console.stdout.content": true,
-			},
-			"log": map[string]interface{}{
-				"level": "trace",
-			},
-		},
+	// Set up chromedp allocator options
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.ExecPath(chromiumExec),
+		chromedp.UserDataDir(profileDir),
+		chromedp.Flag("headless", !config.Headful),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-backgrounding-occluded-windows", true),
+		chromedp.Flag("disable-renderer-backgrounding", true),
+		chromedp.Flag("disable-extensions", true),
+		chromedp.Flag("disable-component-extensions-with-background-pages", true),
+		chromedp.Flag("disable-default-apps", true),
+	)
+
+	// Add window size if specified
+	if config.WindowSize != "" {
+		opts = append(opts, chromedp.WindowSize(parseWindowSize(config.WindowSize)))
 	}
 
-	// Create WebDriver
-	wd, err := selenium.NewRemote(caps, fmt.Sprintf("http://localhost:%d", 4444))
-	if err != nil {
-		return "", fmt.Errorf("could not create webdriver: %v", err)
-	}
-	defer wd.Quit()
+	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer allocCancel()
+
+	ctx, cancel := chromedp.NewContext(allocCtx)
+	defer cancel()
+
+	// Set up timeout
+	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer timeoutCancel()
+	ctx = timeoutCtx
+
+	// Console message capture
+	var consoleMessages []string
+	var consoleMu sync.Mutex
+
+	// Listen for console events
+	chromedp.ListenTarget(ctx, func(ev interface{}) {
+		switch ev := ev.(type) {
+		case *cdpruntime.EventConsoleAPICalled:
+			consoleMu.Lock()
+			defer consoleMu.Unlock()
+
+			level := strings.ToUpper(string(ev.Type))
+			if level == "LOG" {
+				level = "LOG"
+			} else if level == "WARNING" {
+				level = "WARNING"
+			} else if level == "ERROR" {
+				level = "ERROR"
+			}
+
+			var msgParts []string
+			for _, arg := range ev.Args {
+				val := ""
+				if arg.Value != nil {
+					// Properly unmarshal JSON value
+					var strVal string
+					if err := json.Unmarshal(arg.Value, &strVal); err == nil {
+						val = strVal
+					} else {
+						// Fallback: try as raw value (numbers, booleans, etc.)
+						val = strings.Trim(string(arg.Value), "\"")
+					}
+				} else if arg.Description != "" {
+					val = arg.Description
+				}
+				if val != "" {
+					msgParts = append(msgParts, val)
+				}
+			}
+			if len(msgParts) > 0 {
+				consoleMessages = append(consoleMessages, fmt.Sprintf("[%s] %s", level, strings.Join(msgParts, " ")))
+			}
+
+		case *cdpruntime.EventExceptionThrown:
+			consoleMu.Lock()
+			defer consoleMu.Unlock()
+			if ev.ExceptionDetails != nil {
+				msg := ev.ExceptionDetails.Text
+				if ev.ExceptionDetails.Exception != nil && ev.ExceptionDetails.Exception.Description != "" {
+					msg = ev.ExceptionDetails.Exception.Description
+				}
+				consoleMessages = append(consoleMessages, fmt.Sprintf("[ERROR] %s", msg))
+			}
+		}
+	})
 
 	// Navigate to page
-	if err := wd.Get(baseURL); err != nil {
+	err := chromedp.Run(ctx, chromedp.Navigate(baseURL))
+	if err != nil {
 		return "", fmt.Errorf("could not navigate to %s: %v", baseURL, err)
 	}
 
-	// Inject console capture script
-	_, err = wd.ExecuteScript(`
-		if (!window.__consoleMessages) {
-			window.__consoleMessages = [];
-			['log', 'warn', 'error', 'info', 'debug'].forEach(function(method) {
-				var original = console[method];
-				console[method] = function() {
-					var args = Array.prototype.slice.call(arguments);
-					var message = args.map(function(arg) {
-						if (typeof arg === 'object') {
-							try { return JSON.stringify(arg); }
-							catch(e) { return String(arg); }
-						}
-						return String(arg);
-					}).join(' ');
-					window.__consoleMessages.push({
-						level: method,
-						message: message
-					});
-					original.apply(console, arguments);
-				};
-			});
-		}
-	`, nil)
+	// Wait for page to load
+	err = chromedp.Run(ctx, chromedp.WaitReady("body"))
 	if err != nil {
-		fmt.Printf("Warning: Could not inject console capture: %v\n", err)
+		return "", fmt.Errorf("page did not load: %v", err)
 	}
 
 	// Detect LiveView pages
-	isLiveView, err := wd.ExecuteScript("return document.querySelector('[data-phx-session]') !== null", nil)
+	var isLiveView bool
+	err = chromedp.Run(ctx, chromedp.Evaluate(`document.querySelector('[data-phx-session]') !== null`, &isLiveView))
 	if err != nil {
 		isLiveView = false
 	}
 
-	if isLiveView.(bool) {
+	if isLiveView {
 		fmt.Println("Detected Phoenix LiveView page, waiting for connection...")
 		// Wait for Phoenix LiveView to connect
-		err = waitForSelector(wd, ".phx-connected", 10*time.Second)
+		err = waitForSelector(ctx, ".phx-connected", 10*time.Second)
 		if err != nil {
 			fmt.Printf("Warning: Could not detect LiveView connection: %v\n", err)
 		} else {
 			fmt.Println("Phoenix LiveView connected")
 		}
-
-		// Set up navigation tracking using Phoenix events for all page interactions
-		_, err = wd.ExecuteScript(`
-			if (!window.__phxNavigationState) {
-				window.__phxNavigationState = { loading: false };
-				document.addEventListener('phx:page-loading-start', function() {
-					window.__phxNavigationState.loading = true;
-				});
-				document.addEventListener('phx:page-loading-stop', function() {
-					window.__phxNavigationState.loading = false;
-				});
-			}
-		`, nil)
-		if err != nil {
-			fmt.Printf("Warning: Could not inject Phoenix navigation listeners: %v\n", err)
-		}
 	}
 
 	// Handle form submission if specified
 	if config.FormID != "" && len(config.Inputs) > 0 {
-		err = handleForm(wd, config, isLiveView.(bool))
+		err = handleForm(ctx, config, isLiveView)
 		if err != nil {
 			return "", fmt.Errorf("error handling form: %v", err)
 		}
@@ -483,66 +355,38 @@ func processRequest(config Config) (string, error) {
 	// Execute JavaScript if provided
 	if config.JSCode != "" {
 		// Store current URL before executing JS
-		currentURL, _ := wd.CurrentURL()
+		var currentURL string
+		chromedp.Run(ctx, chromedp.Location(&currentURL))
 
-		_, err = wd.ExecuteScript(config.JSCode, nil)
+		var result interface{}
+		err = chromedp.Run(ctx, chromedp.Evaluate(config.JSCode, &result))
 		if err != nil {
 			fmt.Printf("Warning: JavaScript execution failed: %v\n", err)
 		}
 
 		// Wait for navigation based on page type
-		if isLiveView.(bool) {
-			// For LiveView pages, wait for navigation using Phoenix events
+		if isLiveView {
 			fmt.Println("Waiting for Phoenix LiveView navigation...")
+			time.Sleep(500 * time.Millisecond)
 
-			// First, wait briefly for loading to potentially start
-			time.Sleep(100 * time.Millisecond)
-
-			// Check if navigation started
-			err = waitForFunction(wd, "return window.__phxNavigationState && window.__phxNavigationState.loading === true", 1*time.Second)
-			if err != nil {
-				// No navigation event detected, check if URL changed
-				newURL, _ := wd.CurrentURL()
-				if newURL != currentURL {
-					fmt.Println("URL changed, waiting for page to stabilize...")
-					time.Sleep(500 * time.Millisecond)
-				} else {
-					fmt.Println("Info: No navigation detected (in-place LiveView update)")
-				}
+			var newURL string
+			chromedp.Run(ctx, chromedp.Location(&newURL))
+			if newURL != currentURL {
+				fmt.Println("URL changed, waiting for page to stabilize...")
+				time.Sleep(500 * time.Millisecond)
 			} else {
-				// Navigation started, wait for it to complete
-				err = waitForFunction(wd, "return window.__phxNavigationState && window.__phxNavigationState.loading === false", 10*time.Second)
-				if err != nil {
-					fmt.Printf("Warning: Navigation did not complete within timeout: %v\n", err)
-				} else {
-					fmt.Println("Phoenix LiveView navigation completed")
-				}
+				fmt.Println("Info: No navigation detected (in-place LiveView update)")
 			}
 		} else {
-			// For non-LiveView pages, wait for traditional navigation
 			fmt.Println("Waiting for page navigation...")
-
-			// Brief delay to allow navigation to start
 			time.Sleep(200 * time.Millisecond)
 
-			// Wait for URL to change or timeout
-			navigationOccurred := false
-			err = wd.WaitWithTimeout(func(wd selenium.WebDriver) (bool, error) {
-				newURL, err := wd.CurrentURL()
-				if err != nil {
-					return false, nil
-				}
-				if newURL != currentURL {
-					navigationOccurred = true
-					return true, nil
-				}
-				return false, nil
-			}, 5*time.Second)
+			var newURL string
+			chromedp.Run(ctx, chromedp.Location(&newURL))
 
-			if navigationOccurred {
-				// Wait for page to be fully loaded
+			if newURL != currentURL {
 				fmt.Println("Navigation detected, waiting for page load...")
-				err = waitForFunction(wd, "return document.readyState === 'complete'", 5*time.Second)
+				err = chromedp.Run(ctx, chromedp.WaitReady("body"))
 				if err != nil {
 					fmt.Printf("Warning: Page load wait timed out: %v\n", err)
 				} else {
@@ -556,7 +400,8 @@ func processRequest(config Config) (string, error) {
 
 	// Take screenshot if requested
 	if config.ScreenshotPath != "" {
-		screenshot, err := wd.Screenshot()
+		var screenshot []byte
+		err = chromedp.Run(ctx, chromedp.FullScreenshot(&screenshot, 100))
 		if err != nil {
 			return "", fmt.Errorf("error taking screenshot: %v", err)
 		}
@@ -570,54 +415,18 @@ func processRequest(config Config) (string, error) {
 	// Navigate to after-submit URL if provided
 	if config.AfterSubmitURL != "" {
 		fmt.Printf("Navigating to after-submit URL: %s\n", config.AfterSubmitURL)
-		if err := wd.Get(config.AfterSubmitURL); err != nil {
+		err = chromedp.Run(ctx, chromedp.Navigate(config.AfterSubmitURL))
+		if err != nil {
 			return "", fmt.Errorf("could not navigate to after-submit URL: %v", err)
 		}
+		chromedp.Run(ctx, chromedp.WaitReady("body"))
 	}
 
 	// Get page content
-	content, err := wd.PageSource()
+	var content string
+	err = chromedp.Run(ctx, chromedp.OuterHTML("html", &content))
 	if err != nil {
 		return "", fmt.Errorf("could not get page content: %v", err)
-	}
-
-	// Collect ALL logs: console logs (console.log/warn/error) AND browser logs (JS errors, network errors)
-	var consoleMessages []string
-
-	// 1. Collect console.log/warn/error messages from our injected capture
-	capturedLogs, err := wd.ExecuteScript("return window.__consoleMessages || []", nil)
-	if err == nil {
-		if logArray, ok := capturedLogs.([]interface{}); ok {
-			for _, logEntry := range logArray {
-				if logMap, ok := logEntry.(map[string]interface{}); ok {
-					level := "LOG"
-					if lvl, ok := logMap["level"].(string); ok {
-						level = strings.ToUpper(lvl)
-						// Normalize 'warn' to 'warning' to match expected format
-						if level == "WARN" {
-							level = "WARNING"
-						}
-					}
-					message := ""
-					if msg, ok := logMap["message"].(string); ok {
-						message = msg
-					}
-					consoleMessages = append(consoleMessages, fmt.Sprintf("[%s] %s", level, message))
-				}
-			}
-		}
-	}
-
-	// 2. Collect browser logs (JavaScript errors, security errors, network errors, etc.)
-	browserLogs, err := wd.Log(log.Browser)
-	if err == nil {
-		for _, logEntry := range browserLogs {
-			level := strings.ToUpper(string(logEntry.Level))
-			// Only include WARN, ERROR, SEVERE logs from browser to avoid noise
-			if level == "WARNING" || level == "WARN" || level == "ERROR" || level == "SEVERE" {
-				consoleMessages = append(consoleMessages, fmt.Sprintf("[%s] %s", level, logEntry.Message))
-			}
-		}
 	}
 
 	// Return raw HTML if requested
@@ -643,102 +452,90 @@ func processRequest(config Config) (string, error) {
 	result := fmt.Sprintf("==========================\n%s\n==========================\n\n%s", baseURL, markdown)
 
 	// Add console messages if any
+	consoleMu.Lock()
 	if len(consoleMessages) > 0 {
 		result += "\n\n" + strings.Repeat("=", 50) + "\nCONSOLE OUTPUT:\n" + strings.Repeat("=", 50) + "\n"
 		for _, msg := range consoleMessages {
 			result += msg + "\n"
 		}
 	}
+	consoleMu.Unlock()
+
+	// Navigate away to trigger localStorage flush before shutdown
+	chromedp.Run(ctx, chromedp.Navigate("about:blank"))
+	// Wait for navigation to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Explicitly cancel context to ensure browser shuts down
+	timeoutCancel()
+	cancel()
+	// Wait for browser process to fully exit and flush data
+	time.Sleep(500 * time.Millisecond)
+	allocCancel()
 
 	return result, nil
 }
 
 // waitForSelector waits for an element matching the selector to appear
-func waitForSelector(wd selenium.WebDriver, selector string, timeout time.Duration) error {
-	return wd.WaitWithTimeout(func(wd selenium.WebDriver) (bool, error) {
-		_, err := wd.FindElement(selenium.ByCSSSelector, selector)
-		return err == nil, nil
-	}, timeout)
+func waitForSelector(ctx context.Context, selector string, timeout time.Duration) error {
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return chromedp.Run(timeoutCtx, chromedp.WaitVisible(selector))
 }
 
-// waitForFunction waits for a JavaScript condition to be true
-func waitForFunction(wd selenium.WebDriver, jsCode string, timeout time.Duration) error {
-	return wd.WaitWithTimeout(func(wd selenium.WebDriver) (bool, error) {
-		result, err := wd.ExecuteScript(jsCode, nil)
-		if err != nil {
-			return false, nil
-		}
-		if boolResult, ok := result.(bool); ok {
-			return boolResult, nil
-		}
-		return false, nil
-	}, timeout)
-}
-
-func handleForm(wd selenium.WebDriver, config Config, isLiveView bool) error {
+func handleForm(ctx context.Context, config Config, isLiveView bool) error {
 	// Fill form inputs
 	for _, input := range config.Inputs {
 		selector := fmt.Sprintf("#%s input[name='%s']", config.FormID, input.Name)
-		elem, err := wd.FindElement(selenium.ByCSSSelector, selector)
+
+		err := chromedp.Run(ctx,
+			chromedp.WaitVisible(selector),
+			chromedp.Clear(selector),
+			chromedp.SendKeys(selector, input.Value),
+		)
 		if err != nil {
-			return fmt.Errorf("could not find input %s: %v", input.Name, err)
-		}
-		if err := elem.Clear(); err != nil {
-			return fmt.Errorf("could not clear input %s: %v", input.Name, err)
-		}
-		if err := elem.SendKeys(input.Value); err != nil {
 			return fmt.Errorf("could not fill input %s: %v", input.Name, err)
 		}
 	}
 
-	if isLiveView {
-		// For LiveView, use Phoenix event-based navigation tracking
-		formSelector := fmt.Sprintf("#%s", config.FormID)
-		formElem, err := wd.FindElement(selenium.ByCSSSelector, formSelector)
-		if err != nil {
-			return fmt.Errorf("could not find LiveView form: %v", err)
-		}
+	formSelector := fmt.Sprintf("#%s", config.FormID)
 
-		// Submit the form by pressing Enter
-		if err := formElem.SendKeys(selenium.EnterKey); err != nil {
+	if isLiveView {
+		// For LiveView, submit by pressing Enter
+		fmt.Println("Waiting for Phoenix LiveView navigation...")
+		err := chromedp.Run(ctx, chromedp.SendKeys(formSelector, "\r"))
+		if err != nil {
 			return fmt.Errorf("could not submit LiveView form: %v", err)
 		}
 
-		// Wait for Phoenix navigation to complete (phx:page-loading-start -> phx:page-loading-stop)
-		fmt.Println("Waiting for Phoenix LiveView navigation...")
-
-		// First, wait for loading to start (with short timeout)
-		err = waitForFunction(wd, "return window.__phxNavigationState && window.__phxNavigationState.loading === true", 2*time.Second)
-		if err != nil {
-			fmt.Printf("Info: No navigation detected (this is normal for in-place updates)\n")
-		} else {
-			// If navigation started, wait for it to complete
-			err = waitForFunction(wd, "return window.__phxNavigationState && window.__phxNavigationState.loading === false", 10*time.Second)
-			if err != nil {
-				fmt.Printf("Warning: Navigation did not complete within timeout: %v\n", err)
-			} else {
-				fmt.Println("Phoenix LiveView navigation completed")
-			}
-		}
-
+		// Wait for LiveView to process
+		time.Sleep(500 * time.Millisecond)
 		fmt.Println("LiveView form submitted")
 	} else {
-		// For regular forms, click submit button or press enter
+		// For regular forms, try submit button first, then Enter
 		submitSelector := fmt.Sprintf("#%s input[type='submit'], #%s button[type='submit']", config.FormID, config.FormID)
-		elem, err := wd.FindElement(selenium.ByCSSSelector, submitSelector)
-		if err != nil {
-			// Try pressing Enter on the form if no submit button
-			formSelector := fmt.Sprintf("#%s", config.FormID)
-			formElem, err := wd.FindElement(selenium.ByCSSSelector, formSelector)
+
+		var nodes []*cdpruntime.RemoteObject
+		err := chromedp.Run(ctx, chromedp.Evaluate(
+			fmt.Sprintf(`document.querySelectorAll("%s").length`, submitSelector),
+			&nodes,
+		))
+
+		var submitCount int
+		chromedp.Run(ctx, chromedp.Evaluate(
+			fmt.Sprintf(`document.querySelectorAll("%s").length`, submitSelector),
+			&submitCount,
+		))
+
+		if submitCount > 0 {
+			err = chromedp.Run(ctx, chromedp.Click(submitSelector))
 			if err != nil {
-				return fmt.Errorf("could not submit form: %v", err)
-			}
-			if err := formElem.SendKeys(selenium.EnterKey); err != nil {
-				return fmt.Errorf("could not submit form: %v", err)
+				return fmt.Errorf("could not click submit button: %v", err)
 			}
 		} else {
-			if err := elem.Click(); err != nil {
-				return fmt.Errorf("could not click submit button: %v", err)
+			err = chromedp.Run(ctx, chromedp.SendKeys(formSelector, "\r"))
+			if err != nil {
+				return fmt.Errorf("could not submit form: %v", err)
 			}
 		}
 		fmt.Println("Form submitted")
@@ -811,6 +608,13 @@ func parseArgs() Config {
 				config.Profile = args[i+1]
 				i++
 			}
+		case "--headful":
+			config.Headful = true
+		case "--window-size":
+			if i+1 < len(args) {
+				config.WindowSize = args[i+1]
+				i++
+			}
 		default:
 			if config.URL == "" && !strings.HasPrefix(arg, "--") {
 				config.URL = arg
@@ -822,9 +626,9 @@ func parseArgs() Config {
 }
 
 func printHelp() {
-	fmt.Printf(`web - portable web scraper for llms
+	fmt.Printf(`surf - portable web scraper for llms
 
-Usage: web <url> [options]
+Usage: surf <url> [options]
 
 Options:
   --help                     Show this help message
@@ -837,6 +641,8 @@ Options:
   --after-submit <url>       After form submission and navigation, load this URL before converting to markdown
   --js <code>                Execute JavaScript code on the page after it loads
   --profile <name>           Use or create named session profile (default: "default")
+  --headful                  Run browser in visible window mode (not headless)
+  --window-size <WxH>        Set browser window size (e.g., 1280x720), useful with --headful
 
 Phoenix LiveView Support:
 This tool automatically detects Phoenix LiveView applications and properly handles:
@@ -845,10 +651,25 @@ This tool automatically detects Phoenix LiveView applications and properly handl
 - State management between interactions
 
 Examples:
-  web https://example.com
-  web https://example.com --screenshot page.png --truncate-after 5000
-  web localhost:4000/login --form login_form --input email --value test@example.com --input password --value secret
+  surf https://example.com
+  surf https://example.com --screenshot page.png --truncate-after 5000
+  surf https://example.com --headful --window-size 1920x1080
+  surf localhost:4000/login --form login_form --input email --value test@example.com --input password --value secret
 `, DEFAULT_TRUNCATE_AFTER)
+}
+
+// parseWindowSize parses a window size string like "1280x720" into width and height
+func parseWindowSize(size string) (int, int) {
+	parts := strings.Split(size, "x")
+	if len(parts) != 2 {
+		return 1280, 720 // default
+	}
+	width, err1 := strconv.Atoi(parts[0])
+	height, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return 1280, 720 // default
+	}
+	return width, height
 }
 
 // Ensure URL has protocol

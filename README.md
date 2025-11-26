@@ -1,19 +1,21 @@
-# web - shell command for simple LLM web browsing
+# surf - shell command for simple LLM web browsing
 
-shell-based web browser for LLMs that converts web pages to markdown, executes js, and interacts with pages.
+> Fork of [chrismccord/web](https://github.com/chrismccord/web)
+
+Shell-based web browser for LLMs that converts web pages to markdown, executes js, and interacts with pages.
 
 ```bash
 # Convert a webpage to markdown
-web https://example.com
+surf https://example.com
 
 # Take a screenshot while scraping
-web https://example.com --screenshot page.png
+surf https://example.com --screenshot page.png
 
 # Execute JavaScript and capture log output along with markdown content
-web https://example.com --js "console.log(document.title)"
+surf https://example.com --js "console.log(document.title)"
 
 # Fill and submit a form
-web https://login.example.com \
+surf https://login.example.com \
     --form "login_form" \
     --input "username" --value "myuser" \
     --input "password" --value "mypass"
@@ -29,16 +31,17 @@ web https://login.example.com \
 - **Screenshots** - Save full-page screenshots
 - **Form filling** - Automated form interaction with LiveView-aware submissions
 - **Session persistence** - Maintains cookies and authentication across runs with profiles
+- **Headful mode** - Run with visible browser window for debugging
 
 ## Quick Start
 
 1. **Build for current platform**:
    ```bash
-   make              # Build ./web for your platform
-   ./web https://example.com
+   make              # Build ./surf for your platform
+   ./surf https://example.com
    ```
 
-You can then `sudo cp web /usr/local/bin` to make it available system wide
+You can then `sudo cp surf /usr/local/bin` to make it available system wide
 
 ### Multi-platform Build
 
@@ -47,40 +50,43 @@ For releases or deployment to other systems:
 make build        # Build all platforms
 ```
 This creates:
-- `web-darwin-arm64` - macOS Apple Silicon (M1/M2/M3)
-- `web-darwin-amd64` - macOS Intel
-- `web-linux-amd64` - Linux x86_64
+- `surf-darwin-arm64` - macOS Apple Silicon (M1/M2/M3)
+- `surf-darwin-amd64` - macOS Intel
+- `surf-linux-amd64` - Linux x86_64
 
 ## Usage Examples
 
 ```bash
 # Basic scraping
-web https://example.com
+surf https://example.com
 
 # Output raw HTML
-web https://example.com --raw > output.html
+surf https://example.com --raw > output.html
 
 # With truncation and screenshot
-web example.com --screenshot screenshot.png --truncate-after 123
+surf example.com --screenshot screenshot.png --truncate-after 123
+
+# Run with visible browser window
+surf https://example.com --headful --window-size 1920x1080
 
 # Form submission with Phoenix LiveView support
-web http://localhost:4000/users/log-in \
+surf http://localhost:4000/users/log-in \
     --form "login_form" \
     --input "user[email]" --value "foo@bar" \
     --input "user[password]" --value "secret" \
     --after-submit "http://localhost:4000/authd/page"
 
 # Execute JavaScript on the page
-web example.com --js "document.querySelector('button').click()"
+surf example.com --js "document.querySelector('button').click()"
 
 # Use named session profile
-./web --profile "mysite" https://authenticated-site.com
+./surf --profile "mysite" https://authenticated-site.com
 ```
 
 ## Options
 
 ```
-Usage: web <url> [options]
+Usage: surf <url> [options]
 
 Options:
   --help                     Show this help message
@@ -93,6 +99,8 @@ Options:
   --after-submit <url>       After form submission and navigation, load this URL before converting to markdown
   --js <code>                Execute JavaScript code on the page after it loads
   --profile <name>           Use or create named session profile (default: "default")
+  --headful                  Run browser in visible window mode (not headless)
+  --window-size <WxH>        Set browser window size (e.g., 1280x720), useful with --headful
 ```
 
 ## Phoenix LiveView Support
@@ -107,18 +115,15 @@ This tool has special support for Phoenix LiveView applications:
 ## System Requirements
 
 - **Linux x64 or macOS** (Ubuntu 18.04+, RHEL 7+, Debian 9+, Arch Linux, macOS 10.12+)
-- **~102MB free space** (for Firefox and geckodriver on first run)
+- **~150MB free space** (for Chromium on first run)
 
 ### Linux System Packages
 
-On Linux, you may need to install system packages for Firefox:
+On Linux, you may need to install system packages for Chromium:
 
 ```bash
-# Ubuntu/Debian - Core packages for Firefox
-sudo apt install libgtk-3-0 libdbus-glib-1-2 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxi6 libxrandr2 libxss1 libxtst6 libxext6 libasound2 libatspi2.0-0 libdrm2 libxfixes3 libxrender1
-
-# Additional packages for multimedia and fonts
-sudo apt install libpulse0 libcanberra-gtk3-module packagekit-gtk3-module libdbusmenu-glib4 libdbusmenu-gtk3-4
+# Ubuntu/Debian - Core packages for Chromium
+sudo apt install libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2
 ```
 
 
@@ -135,7 +140,7 @@ This will build binaries for all platforms and run tests
 ### Available Commands
 
 ```bash
-make              # Build for current platform (./web)
+make              # Build for current platform (./surf)
 make build        # Build all platforms (darwin-arm64, darwin-amd64, linux-amd64)
 make test         # Build and run tests
 make clean        # Remove build artifacts
@@ -147,16 +152,14 @@ make clean        # Remove build artifacts
 
 ## Architecture
 
-- **Single Go binary with standalone headless firefox download on first run** 
-- **Auto-download on first run** - Firefox and geckodriver downloaded to `~/.web-firefox/`
+- **Single Go binary with standalone headless Chromium download on first run**
+- **Auto-download on first run** - Chromium downloaded to `~/.surf/`
 - **Self-contained directory structure**:
-  - `~/.web-firefox/firefox/` - Headless Firefox browser
-  - `~/.web-firefox/geckodriver/` - WebDriver automation binary
-  - `~/.web-firefox/profiles/` - Isolated session profiles for persistence
+  - `~/.surf/chromium/` - Headless Chromium browser
+  - `~/.surf/profiles/` - Isolated session profiles for persistence
 - **Cross-platform** - Builds for macOS (Intel/ARM64) and Linux x86_64
+- **Chrome DevTools Protocol** - Uses chromedp for direct browser communication (no separate driver needed)
 
 ## License
 
 MIT License
-
-
