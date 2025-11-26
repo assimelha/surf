@@ -33,13 +33,21 @@ surf https://login.example.com \
 - **Session persistence** - Maintains cookies and authentication across runs with profiles
 - **Headful mode** - Run with visible browser window for debugging
 
-## Quick Start
+## Installation
 
-1. **Build for current platform**:
-   ```bash
-   make              # Build ./surf for your platform
-   ./surf https://example.com
-   ```
+### Homebrew (macOS)
+
+```bash
+brew tap assimelha/tap
+brew install surf
+```
+
+### Build from source
+
+```bash
+make              # Build ./surf for your platform
+./surf https://example.com
+```
 
 You can then `sudo cp surf /usr/local/bin` to make it available system wide
 
