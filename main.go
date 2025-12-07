@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/chromedp/cdproto/page"
 	cdpruntime "github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
@@ -24,6 +25,192 @@ import (
 )
 
 const DEFAULT_TRUNCATE_AFTER = 100000
+
+// Realistic Chrome user-agent for macOS
+const STEALTH_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+// Stealth JavaScript to mask automation indicators - runs before page scripts
+const STEALTH_JS = `
+(function() {
+    // Strategy 1: Delete from prototype chain
+    const proto = Object.getPrototypeOf(navigator);
+    if ('webdriver' in proto) {
+        delete proto.webdriver;
+    }
+
+    // Strategy 2: Override with a getter that always returns undefined
+    // Use a closure to prevent any way to detect the original value
+    const webdriverDescriptor = {
+        get: function() { return undefined; },
+        set: function(val) { /* ignore */ },
+        configurable: false,
+        enumerable: false
+    };
+
+    try {
+        Object.defineProperty(navigator, 'webdriver', webdriverDescriptor);
+    } catch(e) {
+        // If it fails, try on prototype
+        try {
+            Object.defineProperty(proto, 'webdriver', webdriverDescriptor);
+        } catch(e2) {}
+    }
+
+    // Strategy 3: Proxy the entire navigator object to intercept property access
+    const navigatorProxy = new Proxy(navigator, {
+        get: function(target, prop) {
+            if (prop === 'webdriver') return undefined;
+            const value = target[prop];
+            return typeof value === 'function' ? value.bind(target) : value;
+        },
+        has: function(target, prop) {
+            if (prop === 'webdriver') return false;
+            return prop in target;
+        }
+    });
+
+    // Replace navigator getter on window
+    try {
+        Object.defineProperty(window, 'navigator', {
+            get: () => navigatorProxy,
+            configurable: false
+        });
+    } catch(e) {
+        // Fallback if window.navigator is not configurable
+    }
+
+    // Strategy 4: Intercept property descriptor access
+    const origGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+    Object.getOwnPropertyDescriptor = function(obj, prop) {
+        if ((obj === navigator || obj === navigatorProxy) && prop === 'webdriver') {
+            return undefined;
+        }
+        return origGetOwnPropertyDescriptor.apply(this, arguments);
+    };
+
+    const origGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+    Object.getOwnPropertyDescriptors = function(obj) {
+        const result = origGetOwnPropertyDescriptors.apply(this, arguments);
+        if (obj === navigator || obj === navigatorProxy) {
+            delete result.webdriver;
+        }
+        return result;
+    };
+
+    // Strategy 5: Override hasOwnProperty
+    const origHasOwnProperty = Object.prototype.hasOwnProperty;
+    Object.prototype.hasOwnProperty = function(prop) {
+        if ((this === navigator || this === navigatorProxy) && prop === 'webdriver') {
+            return false;
+        }
+        return origHasOwnProperty.apply(this, arguments);
+    };
+
+    // Strategy 6: Handle 'in' operator via prototype manipulation
+    const origPropertyIsEnumerable = Object.prototype.propertyIsEnumerable;
+    Object.prototype.propertyIsEnumerable = function(prop) {
+        if ((this === navigator || this === navigatorProxy) && prop === 'webdriver') {
+            return false;
+        }
+        return origPropertyIsEnumerable.apply(this, arguments);
+    };
+})();
+
+// Override navigator.plugins to look like real browser with proper PluginArray prototype
+(function() {
+    const makePluginArray = () => {
+        const plugins = [
+            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '', length: 1 },
+            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 1 }
+        ];
+        // Add MimeType-like objects to each plugin
+        plugins.forEach((p, i) => {
+            p[0] = { type: 'application/pdf', suffixes: 'pdf', description: p.description, enabledPlugin: p };
+        });
+        plugins.item = function(i) { return this[i] || null; };
+        plugins.namedItem = function(name) { return this.find(p => p.name === name) || null; };
+        plugins.refresh = function() {};
+        // Make it inherit from PluginArray prototype
+        Object.setPrototypeOf(plugins, PluginArray.prototype);
+        return plugins;
+    };
+    const pluginArray = makePluginArray();
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => pluginArray,
+        enumerable: true,
+        configurable: false
+    });
+})();
+
+// Override navigator.languages
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en'],
+    configurable: true
+});
+
+// Override navigator.permissions.query
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+);
+
+// Add chrome runtime
+window.chrome = {
+    runtime: {},
+    loadTimes: function() {},
+    csi: function() {},
+    app: {}
+};
+
+// Override iframe contentWindow access pattern detection
+const originalAttachShadow = Element.prototype.attachShadow;
+Element.prototype.attachShadow = function(init) {
+    if (init && init.mode === 'closed') {
+        init.mode = 'open';
+    }
+    return originalAttachShadow.call(this, init);
+};
+
+// Mask automation in WebGL
+const getParameterProxyHandler = {
+    apply: function(target, thisArg, args) {
+        const param = args[0];
+        const gl = thisArg;
+        // UNMASKED_VENDOR_WEBGL
+        if (param === 37445) {
+            return 'Intel Inc.';
+        }
+        // UNMASKED_RENDERER_WEBGL
+        if (param === 37446) {
+            return 'Intel Iris OpenGL Engine';
+        }
+        return Reflect.apply(target, thisArg, args);
+    }
+};
+
+try {
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+    if (gl) {
+        WebGLRenderingContext.prototype.getParameter = new Proxy(
+            WebGLRenderingContext.prototype.getParameter,
+            getParameterProxyHandler
+        );
+    }
+    const gl2 = canvas.getContext('webgl2');
+    if (gl2) {
+        WebGL2RenderingContext.prototype.getParameter = new Proxy(
+            WebGL2RenderingContext.prototype.getParameter,
+            getParameterProxyHandler
+        );
+    }
+} catch(e) {}
+
+console.log('[stealth] Anti-detection measures applied');
+`
 
 type FormInput struct {
 	Name  string
@@ -44,6 +231,7 @@ type Config struct {
 	WindowSize     string
 	Session        string
 	StopSession    bool
+	Stealth        bool
 }
 
 type SessionInfo struct {
@@ -194,6 +382,14 @@ func startSessionBrowser(config Config) (*SessionInfo, error) {
 		"--disable-default-apps",
 		"--no-first-run",
 		"--disable-fre",
+	}
+
+	// Add stealth flags if enabled
+	if config.Stealth {
+		args = append(args,
+			"--disable-blink-features=AutomationControlled",
+			fmt.Sprintf("--user-agent=%s", STEALTH_USER_AGENT),
+		)
 	}
 
 	if !config.Headful {
@@ -462,6 +658,14 @@ func processRequest(config Config) (string, error) {
 			chromedp.Flag("disable-default-apps", true),
 		)
 
+		// Add stealth options if enabled
+		if config.Stealth {
+			opts = append(opts,
+				chromedp.Flag("disable-blink-features", "AutomationControlled"),
+				chromedp.UserAgent(STEALTH_USER_AGENT),
+			)
+		}
+
 		if config.WindowSize != "" {
 			opts = append(opts, chromedp.WindowSize(parseWindowSize(config.WindowSize)))
 		}
@@ -532,6 +736,18 @@ func processRequest(config Config) (string, error) {
 			}
 		}
 	})
+
+	// Inject stealth JS before navigation if enabled (runs before any page scripts)
+	if config.Stealth {
+		err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+			_, err := page.AddScriptToEvaluateOnNewDocument(STEALTH_JS).Do(ctx)
+			return err
+		}))
+		if err != nil {
+			// Non-fatal, log and continue
+			fmt.Fprintf(os.Stderr, "Warning: Could not inject stealth script: %v\n", err)
+		}
+	}
 
 	// Navigate to page
 	err := chromedp.Run(ctx, chromedp.Navigate(baseURL))
@@ -852,6 +1068,8 @@ func parseArgs() Config {
 			}
 		case "--stop":
 			config.StopSession = true
+		case "--stealth":
+			config.Stealth = true
 		default:
 			if config.URL == "" && !strings.HasPrefix(arg, "--") {
 				config.URL = arg
@@ -883,6 +1101,7 @@ Options:
   --window-size <WxH>        Set browser window size (e.g., 1280x720), useful with --headful
   --session <id>             Use persistent browser session (stays open between calls)
   --stop                     Stop a persistent session (requires --session)
+  --stealth                  Enable anti-detection mode (realistic user-agent, hide automation)
 
 Phoenix LiveView Support:
 This tool automatically detects Phoenix LiveView applications and properly handles:
@@ -959,6 +1178,14 @@ PHOENIX LIVEVIEW
   - Handles LiveView form submissions correctly
   - Manages navigation events and state updates
 
+STEALTH MODE (anti-detection)
+  surf https://example.com --stealth
+  Enables anti-detection measures:
+  - Realistic Chrome user-agent (not "Chrome for Testing")
+  - Hides navigator.webdriver property
+  - Disables automation-controlled blink features
+  - Spoofs plugins, languages, and WebGL fingerprints
+
 AGENT INTEGRATION TIPS
   - Output is markdown, optimized for LLM context windows
   - Console logs captured and appended (useful for debugging)
@@ -968,6 +1195,7 @@ AGENT INTEGRATION TIPS
   - Combine --js with --screenshot to capture post-interaction state
   - Use --session for multi-step workflows (faster, maintains state)
   - Multiple agents can use separate --session IDs in parallel
+  - Use --stealth when scraping sites with bot detection
 
 EXAMPLES
   # Scrape and summarize
