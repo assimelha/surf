@@ -232,6 +232,7 @@ type Config struct {
 	Session        string
 	StopSession    bool
 	Stealth        bool
+	UBlock         bool
 }
 
 type SessionInfo struct {
@@ -269,6 +270,14 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error setting up Chromium: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Ensure uBlock Origin is installed if requested
+	if config.UBlock {
+		if err := ensureUBlock(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error setting up uBlock Origin: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Process the request
@@ -310,12 +319,7 @@ func getChromiumExec() string {
 	chromiumDir := getChromiumDir()
 	switch goruntime.GOOS {
 	case "darwin":
-		// Playwright Chromium uses "Google Chrome for Testing.app" and architecture-specific directories
-		archSuffix := ""
-		if goruntime.GOARCH == "arm64" {
-			archSuffix = "-arm64"
-		}
-		return filepath.Join(chromiumDir, "chromium", "chrome-mac"+archSuffix, "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing")
+		return filepath.Join(chromiumDir, "chromium", "chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium")
 	case "linux":
 		return filepath.Join(chromiumDir, "chromium", "chrome-linux", "chrome")
 	default:
@@ -360,7 +364,7 @@ func removeSession(sessionID string) error {
 }
 
 // startSessionBrowser starts a Chrome process for a persistent session
-func startSessionBrowser(config Config) (*SessionInfo, error) {
+func startSessionBrowser(config Config, initialURL string) (*SessionInfo, error) {
 	chromiumExec := getChromiumExec()
 	chromiumDir := getChromiumDir()
 	profileDir := filepath.Join(chromiumDir, "profiles", config.Profile)
@@ -377,11 +381,18 @@ func startSessionBrowser(config Config) (*SessionInfo, error) {
 		"--disable-dev-shm-usage",
 		"--disable-backgrounding-occluded-windows",
 		"--disable-renderer-backgrounding",
-		"--disable-extensions",
 		"--disable-component-extensions-with-background-pages",
 		"--disable-default-apps",
 		"--no-first-run",
 		"--disable-fre",
+	}
+
+	// Only disable extensions if uBlock is not requested
+	if !config.UBlock {
+		args = append(args, "--disable-extensions")
+	} else {
+		// Load uBlock Origin extension
+		args = append(args, fmt.Sprintf("--load-extension=%s", getUBlockDir()))
 	}
 
 	// Add stealth flags if enabled
@@ -401,8 +412,8 @@ func startSessionBrowser(config Config) (*SessionInfo, error) {
 		args = append(args, fmt.Sprintf("--window-size=%d,%d", w, h))
 	}
 
-	// Start with a blank page
-	args = append(args, "about:blank")
+	// Start with the initial URL (visible in the browser window)
+	args = append(args, initialURL)
 
 	cmd := exec.Command(chromiumExec, args...)
 	cmd.Stdout = nil
@@ -423,12 +434,50 @@ func startSessionBrowser(config Config) (*SessionInfo, error) {
 		return nil, fmt.Errorf("browser failed to start: %v", err)
 	}
 
+	// Wait a bit for the page to start loading
+	time.Sleep(1 * time.Second)
+
+	// Get the existing tab's target ID so we reuse it instead of creating a new tab
+	targetID, err := getFirstTargetID(port)
+	if err != nil {
+		cmd.Process.Kill()
+		return nil, fmt.Errorf("failed to get target ID: %v", err)
+	}
+
 	return &SessionInfo{
-		WSURL:   wsURL,
-		Profile: config.Profile,
-		Headful: config.Headful,
-		PID:     cmd.Process.Pid,
+		WSURL:    wsURL,
+		Profile:  config.Profile,
+		Headful:  config.Headful,
+		PID:      cmd.Process.Pid,
+		TargetID: targetID,
 	}, nil
+}
+
+// getFirstTargetID gets the target ID of the first page tab from CDP
+func getFirstTargetID(port int) (string, error) {
+	url := fmt.Sprintf("http://127.0.0.1:%d/json/list", port)
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var targets []struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
+		URL  string `json:"url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&targets); err != nil {
+		return "", err
+	}
+
+	// Find the first "page" type target
+	for _, t := range targets {
+		if t.Type == "page" {
+			return t.ID, nil
+		}
+	}
+	return "", fmt.Errorf("no page target found")
 }
 
 func findFreePort() int {
@@ -469,18 +518,18 @@ func ensureChromium() error {
 	}
 
 	// Download and extract Chromium
-	fmt.Println("Chromium not found, downloading...")
+	fmt.Fprintln(os.Stderr, "Chromium not found, downloading...")
 
 	var chromiumUrl string
 	switch goruntime.GOOS {
 	case "darwin":
 		if goruntime.GOARCH == "arm64" {
-			chromiumUrl = "https://playwright.azureedge.net/builds/chromium/1200/chromium-mac-arm64.zip"
+			chromiumUrl = "https://download-chromium.appspot.com/dl/Mac_Arm?type=snapshots"
 		} else {
-			chromiumUrl = "https://playwright.azureedge.net/builds/chromium/1200/chromium-mac.zip"
+			chromiumUrl = "https://download-chromium.appspot.com/dl/Mac?type=snapshots"
 		}
 	case "linux":
-		chromiumUrl = "https://playwright.azureedge.net/builds/chromium/1200/chromium-linux.zip"
+		chromiumUrl = "https://download-chromium.appspot.com/dl/Linux_x64?type=snapshots"
 	}
 
 	chromiumDir := getChromiumDir()
@@ -495,6 +544,63 @@ func ensureChromium() error {
 	}
 
 	fmt.Printf("Chromium downloaded to: %s\n", chromiumDir)
+	return nil
+}
+
+func getUBlockDir() string {
+	return filepath.Join(getChromiumDir(), "ublock")
+}
+
+func ensureUBlock() error {
+	uBlockDir := getUBlockDir()
+	manifestPath := filepath.Join(uBlockDir, "manifest.json")
+
+	// Check if uBlock is already installed
+	if _, err := os.Stat(manifestPath); err == nil {
+		return nil
+	}
+
+	fmt.Fprintln(os.Stderr, "uBlock Origin not found, downloading...")
+
+	// Download uBlock Origin Lite (uBOL) - official MV3 version
+	// https://github.com/uBlockOrigin/uBOL-home/releases
+	uBlockURL := "https://github.com/uBlockOrigin/uBOL-home/releases/download/2025.1130.1739/uBOLite_2025.1130.1739.chromium.zip"
+
+	// Create temp file
+	tempFile, err := os.CreateTemp("", "ublock-*.zip")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
+
+	// Download
+	resp, err := http.Get(uBlockURL)
+	if err != nil {
+		return fmt.Errorf("failed to download uBlock: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download uBlock: status %d", resp.StatusCode)
+	}
+
+	if _, err := io.Copy(tempFile, resp.Body); err != nil {
+		return fmt.Errorf("failed to save uBlock: %v", err)
+	}
+	tempFile.Close()
+
+	// Extract to parent dir (zip contains uBlock0.chromium folder)
+	extractDir := filepath.Join(getChromiumDir(), "ublock")
+	if err := os.MkdirAll(extractDir, 0755); err != nil {
+		return fmt.Errorf("failed to create uBlock dir: %v", err)
+	}
+
+	if err := extractZip(tempFile.Name(), extractDir); err != nil {
+		return fmt.Errorf("failed to extract uBlock: %v", err)
+	}
+
+	fmt.Fprintln(os.Stderr, "uBlock Origin installed")
 	return nil
 }
 
@@ -605,11 +711,15 @@ func processRequest(config Config) (string, error) {
 			sessionInfo = existingSession
 			fmt.Fprintf(os.Stderr, "Connecting to session '%s'...\n", config.Session)
 		} else {
-			// Start new session browser
+			// Start new session browser with the initial URL
 			fmt.Fprintf(os.Stderr, "Starting new session '%s'...\n", config.Session)
-			sessionInfo, err = startSessionBrowser(config)
+			sessionInfo, err = startSessionBrowser(config, baseURL)
 			if err != nil {
 				return "", err
+			}
+			// Save the new session immediately
+			if err := saveSession(config.Session, *sessionInfo); err != nil {
+				return "", fmt.Errorf("failed to save session: %v", err)
 			}
 		}
 
@@ -617,26 +727,9 @@ func processRequest(config Config) (string, error) {
 		allocCtx, allocCancelFunc := chromedp.NewRemoteAllocator(context.Background(), sessionInfo.WSURL)
 		allocCancel = allocCancelFunc
 
-		if sessionInfo.TargetID != "" {
-			// Attach to existing tab
-			ctx, cancel = chromedp.NewContext(allocCtx,
-				chromedp.WithTargetID(target.ID(sessionInfo.TargetID)))
-		} else {
-			// Create new tab
-			ctx, cancel = chromedp.NewContext(allocCtx)
-		}
-
-		// If this is a new session (no target ID yet), save it after first run
-		if sessionInfo.TargetID == "" {
-			// We need to run something to create the target, then get its ID
-			if err := chromedp.Run(ctx); err != nil {
-				return "", fmt.Errorf("failed to initialize browser context: %v", err)
-			}
-			sessionInfo.TargetID = string(chromedp.FromContext(ctx).Target.TargetID)
-			if err := saveSession(config.Session, *sessionInfo); err != nil {
-				return "", fmt.Errorf("failed to save session: %v", err)
-			}
-		}
+		// Attach to existing tab (we always have a target ID now)
+		ctx, cancel = chromedp.NewContext(allocCtx,
+			chromedp.WithTargetID(target.ID(sessionInfo.TargetID)))
 	} else {
 		// One-shot mode: start fresh browser that will be closed
 		chromiumExec := getChromiumExec()
@@ -653,10 +746,16 @@ func processRequest(config Config) (string, error) {
 			chromedp.Flag("disable-dev-shm-usage", true),
 			chromedp.Flag("disable-backgrounding-occluded-windows", true),
 			chromedp.Flag("disable-renderer-backgrounding", true),
-			chromedp.Flag("disable-extensions", true),
 			chromedp.Flag("disable-component-extensions-with-background-pages", true),
 			chromedp.Flag("disable-default-apps", true),
 		)
+
+		// Only disable extensions if uBlock is not requested
+		if !config.UBlock {
+			opts = append(opts, chromedp.Flag("disable-extensions", true))
+		} else {
+			opts = append(opts, chromedp.Flag("load-extension", getUBlockDir()))
+		}
 
 		// Add stealth options if enabled
 		if config.Stealth {
@@ -1070,6 +1169,8 @@ func parseArgs() Config {
 			config.StopSession = true
 		case "--stealth":
 			config.Stealth = true
+		case "--ublock":
+			config.UBlock = true
 		default:
 			if config.URL == "" && !strings.HasPrefix(arg, "--") {
 				config.URL = arg
