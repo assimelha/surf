@@ -260,7 +260,8 @@ func main() {
 		return
 	}
 
-	if config.URL == "" {
+	// URL is required unless we're in session mode with --js or --screenshot
+	if config.URL == "" && (config.Session == "" || (config.JSCode == "" && config.ScreenshotPath == "")) {
 		printHelp()
 		os.Exit(1)
 	}
@@ -695,7 +696,10 @@ func extractZip(src, dest string) error {
 }
 
 func processRequest(config Config) (string, error) {
-	baseURL := ensureProtocol(config.URL)
+	var baseURL string
+	if config.URL != "" {
+		baseURL = ensureProtocol(config.URL)
+	}
 
 	var ctx context.Context
 	var cancel context.CancelFunc
@@ -848,16 +852,19 @@ func processRequest(config Config) (string, error) {
 		}
 	}
 
-	// Navigate to page
-	err := chromedp.Run(ctx, chromedp.Navigate(baseURL))
-	if err != nil {
-		return "", fmt.Errorf("could not navigate to %s: %v", baseURL, err)
-	}
+	// Navigate to page (skip if no URL in session mode - just use current page)
+	var err error
+	if baseURL != "" {
+		err = chromedp.Run(ctx, chromedp.Navigate(baseURL))
+		if err != nil {
+			return "", fmt.Errorf("could not navigate to %s: %v", baseURL, err)
+		}
 
-	// Wait for page to load
-	err = chromedp.Run(ctx, chromedp.WaitReady("body"))
-	if err != nil {
-		return "", fmt.Errorf("page did not load: %v", err)
+		// Wait for page to load
+		err = chromedp.Run(ctx, chromedp.WaitReady("body"))
+		if err != nil {
+			return "", fmt.Errorf("page did not load: %v", err)
+		}
 	}
 
 	// Detect LiveView pages
@@ -982,8 +989,14 @@ func processRequest(config Config) (string, error) {
 		markdown = markdown[:config.TruncateAfter] + fmt.Sprintf("\n\n... (output truncated after %d chars, full content was %d chars)", config.TruncateAfter, len(text))
 	}
 
+	// Get current URL for the header (in case we didn't navigate, e.g. session with --js only)
+	displayURL := baseURL
+	if displayURL == "" {
+		chromedp.Run(ctx, chromedp.Location(&displayURL))
+	}
+
 	// Add header with URL and console messages
-	result := fmt.Sprintf("==========================\n%s\n==========================\n\n%s", baseURL, markdown)
+	result := fmt.Sprintf("==========================\n%s\n==========================\n\n%s", displayURL, markdown)
 
 	// Add console messages if any
 	consoleMu.Lock()
@@ -1201,6 +1214,7 @@ Options:
   --headful                  Run browser in visible window mode (not headless)
   --window-size <WxH>        Set browser window size (e.g., 1280x720), useful with --headful
   --session <id>             Use persistent browser session (stays open between calls)
+                             With an active session, URL is optional if using --js or --screenshot
   --stop                     Stop a persistent session (requires --session)
   --stealth                  Enable anti-detection mode (realistic user-agent, hide automation)
 
@@ -1262,6 +1276,8 @@ PERSISTENT SESSIONS (keep browser open between calls)
   surf https://example.com --session myapp            # Start session, fetch page
   surf https://example.com/page2 --session myapp      # Reuse same browser
   surf https://example.com/page3 --session myapp --screenshot page.png
+  surf --session myapp --js "document.querySelector('button').click()"  # Run JS on current page (no URL needed)
+  surf --session myapp --screenshot current.png       # Screenshot current page (no URL needed)
   surf --session myapp --stop                         # Close browser when done
 
   Multiple sessions can run in parallel:
